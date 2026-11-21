@@ -1,0 +1,103 @@
+# Production stack for insightboard.example.com
+# DB and app are NOT exposed to the host — only Caddy on 80/443.
+
+services:
+    db:
+        image: postgres:16-alpine
+        restart: unless-stopped
+        environment:
+            POSTGRES_USER: ${POSTGRES_USER:-insightboard}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+            POSTGRES_DB: ${POSTGRES_DB:-insightboardistik}
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+        networks:
+            - internal
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-insightboard} -d ${POSTGRES_DB:-insightboardistik}"]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+            start_period: 20s
+        security_opt:
+            - no-new-privileges:true
+        # No ports: — database is reachable only inside Docker network "internal"
+
+    app:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        restart: unless-stopped
+        depends_on:
+            db:
+                condition: service_healthy
+        environment:
+            DATABASE_URL: postgresql://${POSTGRES_USER:-insightboard}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-insightboardistik}?schema=public&sslmode=disable
+            ADMIN_SECRET: ${ADMIN_SECRET:?ADMIN_SECRET is required}
+            ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+            ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+            NODE_ENV: production
+            NEXT_PUBLIC_APP_URL: https://${DOMAIN:-insightboard.example.com}
+            FUNNELS_DATA_DIR: /app/data/funnels
+        volumes:
+            - funnels_data:/app/data/funnels
+        networks:
+            - internal
+            - web
+        security_opt:
+            - no-new-privileges:true
+        # allow writing funnel ZIPs; tmpfs alone is not enough for persistence
+        tmpfs:
+            - /tmp
+        # Ensure app can chown the funnels volume on start (start.sh drops to nextjs)
+        cap_add:
+            - CHOWN
+            - SETUID
+            - SETGID
+            - FOWNER
+        healthcheck:
+            test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ru/login >/dev/null 2>&1 || exit 1"]
+            interval: 15s
+            timeout: 10s
+            retries: 8
+            start_period: 120s
+        # No ports: — app is reachable only via Caddy on network "web"
+
+    caddy:
+        image: caddy:2-alpine
+        restart: unless-stopped
+        depends_on:
+            app:
+                condition: service_healthy
+        ports:
+            - "80:80"
+            - "443:443"
+            - "443:443/udp"
+        environment:
+            DOMAIN: ${DOMAIN:-insightboard.example.com}
+            ACME_EMAIL: ${ACME_EMAIL:-}
+        volumes:
+            - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+            - caddy_data:/data
+            - caddy_config:/config
+        networks:
+            - web
+        security_opt:
+            - no-new-privileges:true
+        cap_drop:
+            - ALL
+        cap_add:
+            - NET_BIND_SERVICE
+
+networks:
+    internal:
+        driver: bridge
+        internal: true
+    web:
+        driver: bridge
+
+volumes:
+    postgres_data:
+    caddy_data:
+    caddy_config:
+    funnels_data:
